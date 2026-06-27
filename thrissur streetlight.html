@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Street Light GIS Monitoring System</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css">
+<style>
+body { margin:0; font-family:Arial,sans-serif; }
+#loginOverlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(11, 83, 148, 0.95); z-index: 9999; display: flex; align-items: center; justify-content: center; color: white; }
+.login-box { background: white; padding: 25px; border-radius: 8px; color: #333; width: 90%; max-width: 360px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+.login-box h2 { margin-top: 0; color: #0b5394; text-align: center; }
+.login-box input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+.login-box button { width: 100%; padding: 10px; background: #0b5394; color: white; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 16px; }
+.login-box button:hover { background: #083c6b; }
+
+#header { background:#0b5394; color:white; padding:12px; font-size:20px; font-weight:bold; display: flex; justify-content: space-between; align-items: center; }
+#logoutBtn { background: rgba(255,255,255,0.2); color: white; border: 1px solid white; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+#logoutBtn:hover { background: white; color: #0b5394; }
+
+#toolbar { padding:10px; background:#f2f2f2; border-bottom:1px solid #ccc; display: flex; flex-wrap: wrap; gap: 6px; }
+#toolbar select, #toolbar input, #toolbar button { padding:8px; font-size: 14px; vertical-align: middle; flex-grow: 1; min-width: 120px; }
+#gpsBtn { background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+#gpsBtn:hover { background: #218838; }
+#clearBtn { background: #dc3545; color: white; border: none; border-radius: 4px; cursor: pointer; }
+#clearBtn:hover { background: #bd2130; }
+#summary { padding:10px; background:#fff8dc; font-weight:bold; font-size: 14px; }
+
+#map { height:70vh; }
+.popup-img { width:100%; max-width:250px; max-height:220px; object-fit:contain; border:1px solid #ccc; margin-top:8px; display:block; }
+.leaflet-popup-content { font-size: 15px; line-height: 1.4; padding: 5px; }
+</style>
+</head>
+<body>
+
+<div id="loginOverlay">
+    <div class="login-box">
+        <h2>GIS System Login</h2>
+        <input type="text" id="username" placeholder="Username">
+        <input type="password" id="password" placeholder="Password">
+        <button onclick="handleLogin()">Sign In</button>
+    </div>
+</div>
+
+<div id="header">
+    <span>Street Light GIS Monitoring System</span>
+    <button id="logoutBtn" onclick="handleLogout()" style="display:none;">Logout</button>
+</div>
+
+<div id="toolbar">
+    <input type="file" id="jsonFile" accept=".json">
+    <select id="fuseFilter"><option value="">All Fuses</option></select>
+    <select id="divisionFilter"><option value="">All Divisions</option></select>
+    <input type="text" id="searchBox" placeholder="Unique No / Post No">
+    <button id="searchBtn">Search</button>
+    <button id="gpsBtn" onclick="showMyLocation()">📍 My Location</button>
+    <button id="clearBtn" onclick="clearStoredData()">🗑️ Clear Saved Data</button>
+</div>
+
+<div id="summary">
+    Total Lights : 0 | 15W : 0 | 20W : 0 | 24W : 0 | 40W : 0 | 70W : 0 | 100W : 0
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+const USER_DB = {
+    "thomas sebastian": { pass: "thomas225122", role: "admin" },
+    "user 1": { pass: "5876248", role: "field" },
+    "user 2": { pass: "5873548", role: "field" },
+    "user 3": { pass: "5876354", role: "field" },
+    "user 4": { pass: "5876241", role: "field" }, 
+    "user 5": { pass: "5876242", role: "field" },
+    "user 6": { pass: "5876243", role: "field" }
+};
+
+let currentUser = null;
+let currentRole = null;
+let data = [];
+let userLocationMarker = null;
+let isInitialLoad = true; 
+
+const mobileCanvasRenderer = L.canvas({ tolerance: 15 });
+const map = L.map('map', {
+    renderer: mobileCanvasRenderer,
+    maxZoom: 18,
+    tap: false 
+}).setView([10.524, 76.252], 13);
+
+const esriSatellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 18,
+    attribution: 'Tiles © Esri'
+}).addTo(map);
+
+const openStreetMap = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18 });
+
+L.control.layers({
+    "Satellite Imagery": esriSatellite,
+    "Standard Street Map": openStreetMap
+}, {}).addTo(map);
+
+const standaloneMarkerLayer = L.layerGroup().addTo(map);
+
+function getAdaptiveRadius() {
+    const currentZoom = map.getZoom();
+    if (currentZoom <= 12) return 5;
+    if (currentZoom === 13) return 6;
+    if (currentZoom === 14) return 8;
+    if (currentZoom === 15) return 10;
+    if (currentZoom === 16) return 12;
+    if (currentZoom === 17) return 13;
+    return 14; 
+}
+
+map.on('zoomend', () => {
+    const newRadius = getAdaptiveRadius();
+    standaloneMarkerLayer.eachLayer((layer) => { if (layer.setRadius) layer.setRadius(newRadius); });
+    saveMapState();
+});
+map.on('moveend', () => saveMapState());
+
+function getColor(watt) {
+    switch(watt) {
+        case "15": return "#00FF00";
+        case "20": return "#0000FF";
+        case "24": return "#FFD700";
+        case "40": return "#FFA500";
+        case "70": return "#FF0000";
+        case "100": return "#FF00FF";
+        default: return "#FFFF00";
+    }
+}
+
+document.getElementById("jsonFile").addEventListener("change", loadJSONFile);
+document.getElementById("fuseFilter").addEventListener("change", () => { updateDivisionFilter(); loadLights(); saveMapState(); });
+document.getElementById("divisionFilter").addEventListener("change", () => { loadLights(); saveMapState(); });
+document.getElementById("searchBtn").addEventListener("click", () => { loadLights(); saveMapState(); });
+document.getElementById("username").addEventListener("keyup", (e) => { if(e.key === "Enter") handleLogin(); });
+document.getElementById("password").addEventListener("keyup", (e) => { if(e.key === "Enter") handleLogin(); });
+
+const DB_NAME = "GIS_Monitoring_DB";
+const STORE_NAME = "StreetLightsStore";
+
+function getDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, 1);
+        request.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME);
+        };
+        request.onsuccess = (e) => resolve(e.target.result);
+        request.onerror = (e) => reject(e.target.error);
+    });
+}
+
+async function saveToDB(key, payload) {
+    try {
+        const db = await getDB();
+        const tx = db.transaction(STORE_NAME, "readwrite");
+        const store = tx.objectStore(STORE_NAME);
+        store.put(payload, key);
+        return new Promise((resolve) => tx.oncomplete = () => resolve());
+    } catch (err) { console.error(err); }
+}
+
+async function loadFromDB(key) {
+    try {
+        const db = await getDB();
+        const tx = db.transaction(STORE_NAME, "readonly");
+        const store = tx.objectStore(STORE_NAME);
+        return new Promise((resolve) => {
+            const req = store.get(key);
+            req.onsuccess = () => resolve(req.result || null);
+        });
+    } catch (err) { return null; }
+}
+
+async function clearDB() {
+    try {
+        const db = await getDB();
+        const tx = db.transaction(STORE_NAME, "readwrite");
+        const store = tx.objectStore(STORE_NAME);
+        store.clear();
+    } catch (err) { console.error(err); }
+}
+
+window.addEventListener('DOMContentLoaded', async () => {
+    const savedUserSession = await loadFromDB("session_user");
+    if (savedUserSession && USER_DB[savedUserSession]) {
+        currentUser = savedUserSession;
+        currentRole = USER_DB[savedUserSession].role;
+        
+        document.getElementById("loginOverlay").style.display = "none";
+        document.getElementById("logoutBtn").style.display = "block";
+        
+        await initializeCoreSystemData();
+    }
+});
+
+async function handleLogin() {
+    const userInp = document.getElementById("username").value.trim().toLowerCase();
+    const passInp = document.getElementById("password").value;
+
+    let targetUserData = null;
+    let explicitMatchedUsername = null;
+    
+    for (const key of Object.keys(USER_DB)) {
+        if (key.toLowerCase() === userInp) {
+            targetUserData = USER_DB[key];
+            explicitMatchedUsername = key;
+            break;
+        }
+    }
+
+    if (targetUserData && targetUserData.pass === passInp) {
+        currentUser = explicitMatchedUsername;
+        currentRole = targetUserData.role;
+        
+        await saveToDB("session_user", currentUser);
+        
+        document.getElementById("loginOverlay").style.display = "none";
+        document.getElementById("logoutBtn").style.display = "block";
+        document.getElementById("username").value = "";
+        document.getElementById("password").value = "";
+        
+        await initializeCoreSystemData();
+    } else {
+        alert("Invalid Username or Password!");
+    }
+}
+
+async function handleLogout() {
+    await saveToDB("session_user", null);
+    currentUser = null;
+    currentRole = null;
+    if (userLocationMarker) {
+        map.removeLayer(userLocationMarker);
+        userLocationMarker = null;
+    }
+    document.getElementById("loginOverlay").style.display = "flex";
+    document.getElementById("logoutBtn").style.display = "none";
+}
+
+async function initializeCoreSystemData() {
+    const savedData = await loadFromDB("current_data");
+    if (savedData && Array.isArray(savedData)) {
+        data = savedData;
+        loadFilters();
+
+        const savedState = await loadFromDB("map_state");
+        if (savedState) {
+            document.getElementById("fuseFilter").value = savedState.fuse || "";
+            updateDivisionFilter(true); 
+            document.getElementById("divisionFilter").value = savedState.division || "";
+            document.getElementById("searchBox").value = savedState.search || "";
+            
+            loadLights();
+
+            if (savedState.center && savedState.zoom) {
+                map.setView([savedState.center.lat, savedState.center.lng], savedState.zoom, { animate: false });
+            }
+            isInitialLoad = false;
+        } else {
+            loadLights();
+            isInitialLoad = false;
+        }
+    } else {
+        isInitialLoad = false;
+    }
+}
+
+async function saveMapState() {
+    if (!data || data.length === 0) return;
+    const state = {
+        center: map.getCenter(),
+        zoom: map.getZoom(),
+        fuse: document.getElementById("fuseFilter").value,
+        division: document.getElementById("divisionFilter").value,
+        search: document.getElementById("searchBox").value
+    };
+    await saveToDB("map_state", state);
+}
+
+async function loadJSONFile(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    try {
+        const text = await file.text();
+        data = JSON.parse(text);
+        await saveToDB("current_data", data);
+        loadFilters();
+        loadLights();
+        saveMapState();
+    } catch (ex) { alert("JSON Error: " + ex.message); }
+}
+
+async function clearStoredData() {
+    if(confirm("Remove stored data?")) {
+        await clearDB();
+        data = [];
+        standaloneMarkerLayer.clearLayers();
+        if (userLocationMarker) {
+            map.removeLayer(userLocationMarker);
+            userLocationMarker = null;
+        }
+        document.getElementById("fuseFilter").innerHTML = '<option value="">All Fuses</option>';
+        document.getElementById("divisionFilter").innerHTML = '<option value="">All Divisions</option>';
+        document.getElementById("searchBox").value = "";
+        document.getElementById("summary").innerHTML = "Total Lights : 0 | 15W : 0 | 20W : 0 | 24W : 0 | 40W : 0 | 70W : 0 | 100W : 0";
+        map.setView([10.524, 76.252], 13);
+    }
+}
+
+function loadFilters() {
+    const fuseDDL = document.getElementById("fuseFilter");
+    fuseDDL.innerHTML = '<option value="">All Fuses</option>';
+    const fuses = [...new Set(data.map(x => x.fuse ? String(x.fuse).trim() : ""))].filter(Boolean);
+    fuses.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+    fuses.forEach(f => {
+        const o = document.createElement("option");
+        o.value = f; o.text = f; fuseDDL.appendChild(o);
+    });
+    updateDivisionFilter(true);
+}
+
+function updateDivisionFilter(skipRedirect = false) {
+    const fuse = document.getElementById("fuseFilter").value;
+    const divDDL = document.getElementById("divisionFilter");
+    divDDL.innerHTML = '<option value="">All Divisions</option>';
+    let rows = data;
+    
+    if (fuse !== "") {
+        rows = data.filter(r => r.fuse && String(r.fuse).trim() === fuse);
+        if (!skipRedirect) {
+            let fuseBounds = [];
+            rows.forEach(r => {
+                let lat = parseFloat(r.lat);
+                let lon = parseFloat(r.lon);
+                if (!isNaN(lat) && !isNaN(lon)) fuseBounds.push([lat, lon]);
+            });
+            if (fuseBounds.length > 0) {
+                map.fitBounds(fuseBounds, { padding: [30, 30], maxZoom: 16 });
+            }
+        }
+    }
+    const divisions = [...new Set(rows.map(r => r.division ? String(r.division).trim() : ""))].filter(Boolean).sort();
+    divisions.forEach(d => {
+        const o = document.createElement("option");
+        o.value = d; o.text = d; divDDL.appendChild(o);
+    });
+}
+
+function loadLights() {
+    standaloneMarkerLayer.clearLayers();
+    const fuse = document.getElementById("fuseFilter").value;
+    const div = document.getElementById("divisionFilter").value;
+    const search = document.getElementById("searchBox").value.toUpperCase();
+
+    let total = 0;
+    let counts = { "15": 0, "20": 0, "24": 0, "40": 0, "70": 0, "100": 0 };
+    let boundsGroup = [];
+    const currentRadius = getAdaptiveRadius();
+
+    data.forEach(r => {
+        if (fuse !== "" && (!r.fuse || String(r.fuse).trim() !== fuse)) return;
+        if (div !== "" && (!r.division || String(r.division).trim() !== div)) return;
+        if (search !== "") {
+            let txt = (String(r.unique || "") + " " + String(r.postno || "")).toUpperCase();
+            if (!txt.includes(search)) return;
+        }
+
+        let lat = parseFloat(r.lat);
+        let lon = parseFloat(r.lon);
+        if (isNaN(lat) || isNaN(lon)) return;
+
+        total++;
+        let watt = String(r.wattage || "").toUpperCase().replace("W", "").trim();
+        if (counts[watt] !== undefined) counts[watt]++;
+
+        const marker = L.circleMarker([lat, lon], {
+            radius: currentRadius,
+            fillColor: getColor(watt),
+            color: "#ffffff",
+            weight: 2,
+            opacity: 1,
+            fillOpacity: 0.95
+        });
+        
+        let imageHTML = "";
+        let imageLinkHTML = "";
+        if (r.image && String(r.image).trim() !== "" && r.image !== "UUID NOT FOUND") {
+            const cleanUrl = String(r.image).trim();
+            imageHTML = `<img class="popup-img" src="${cleanUrl}" onerror="this.style.display='none';"><br>`;
+            imageLinkHTML = `<b>Pole Picture:</b> <a target="_blank" href="${cleanUrl}">View Pole Photo</a><br>`;
+        } else {
+            imageLinkHTML = `<b>Pole Picture:</b> N/A<br>`;
+        }
+        
+        marker.bindPopup(`
+            <h3 style="margin:0 0 8px 0;">ID: ${r.unique || 'N/A'}</h3>
+            ${imageHTML}
+            <b>Fuse:</b> ${r.fuse || 'N/A'}<br>
+            <b>Division:</b> ${r.division || 'N/A'}<br>
+            <b>Junction:</b> ${r.junction || 'N/A'}<br>
+            <b>Main Control:</b> ${r.main || 'N/A'}<br>
+            <b>Lamp Type:</b> ${r.lamp || 'N/A'}<br>
+            <b>Post No:</b> ${r.postno || 'N/A'}<br>
+            <b>Wattage:</b> ${r.wattage || 'N/A'}<br>
+            ${imageLinkHTML}
+            <br><a target="_blank" href="http://maps.google.com/?q=${lat},${lon}">Open Google Maps</a>
+        `);
+
+        standaloneMarkerLayer.addLayer(marker);
+        boundsGroup.push([lat, lon]);
+    });
+
+    if (isInitialLoad && boundsGroup.length > 0) {
+        map.fitBounds(boundsGroup);
+    }
+
+    document.getElementById("summary").innerHTML = 
+        `Total Lights : ${total} | 15W : ${counts["15"]} | 20W : ${counts["20"]} | 24W : ${counts["24"]} | 40W : ${counts["40"]} | 70W : ${counts["70"]} | 100W : ${counts["100"]}`;
+}
+
+function showMyLocation() {
+    if (!navigator.geolocation) {
+        alert("Geolocation is not supported by your browser.");
+        return;
+    }
+    navigator.geolocation.getCurrentPosition((position) => {
+        const userLat = position.coords.latitude;
+        const userLon = position.coords.longitude;
+        
+        if (userLocationMarker) map.removeLayer(userLocationMarker);
+        userLocationMarker = L.marker([userLat, userLon], {
+            icon: L.divIcon({ html: "🔵", className: "gps-marker", iconSize: [20, 20], iconAnchor: [10, 10] })
+        }).addTo(map).bindPopup("<b>Your Current Position</b>").openPopup();
+        
+        map.setView([userLat, userLon], 16);
+    }, (error) => {
+        alert("Unable to retrieve position: " + error.message);
+    }, { enableHighAccuracy: true });
+}
+</script>
+</body>
+</html>
